@@ -1,0 +1,1224 @@
+---
+title: "Lactate-Discordance"
+author: "Nuria"
+date: "30/7/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Lactate Discordance Project: Exploratory Analysis of Lactate in MIMIC-III, eICU and HJ23 by Illness Severity
+
+
+This notebook extracts the maximum lactate in the first 24 hours for all patients in the three databases. After excluding patients with length of stay below 24 hours, those lacking data, and those under the age of 16, the lactate levels are grouped using deciles and quartiles of each severity of illness score.
+
+# Libraries
+
+```{r}
+require(dbplyr)
+require(dplyr)
+require(RPostgreSQL)
+require(sqldf) 
+require(tidyverse)
+require(reshape2)
+require(lubridate)
+require(mice)
+require(caret)
+require(ROCR)
+
+```
+
+
+# 1 - Load variables 
+
+## 1.1 - Load HJ23 variables 
+ 
+HJ23 database is imported with csv files. 
+Data information of patients, ICU lab variables and vasopressors doses for the first 24 hours.
+The number of vars here corresponds to an initial subset of vars that will be modified in next steps.
+(These files will be included in the project when the Ethic Committee of our Hospital approves the project)
+
+```{r, message=FALSE}
+
+pats <- read.csv("C:/Lactate/LACTATE_PROJECT/Patients.csv",dec = ',')
+vars <- read.csv("C:/Lactate/LACTATE_PROJECT/Vars.csv",dec = ',')
+drugs <- read.csv("C:/Lactate/LACTATE_PROJECT/Drugs.csv",dec = ',')
+other_vars <- read.csv("C:/Lactate/LACTATE_PROJECT/VarsAddition.csv",dec = ',')
+
+colnames(pats)[1] <- 'PatientID'
+colnames(vars)[1] <- 'PatientID'
+colnames(drugs)[1] <- 'PatientID'
+colnames(other_vars)[1] <- 'PatientID'
+
+```
+
+
+### Clean and transform data
+
+Transform all the information into a dataframe with a label for each variable.
+
+```{r, message=FALSE}
+#delete columns 
+num_features <- select(vars, PatientID, VarName, MinValue, MaxValue, MedianValue)
+#delete repeated entries
+num_features2 <- as.data.frame(num_features %>% distinct(PatientID, VarName, 
+                                                         .keep_all = TRUE))
+
+rm(num_features)
+#Dataframe with drugs' patients
+base <- as.data.frame(drugs[,1])
+base <- unique(base)
+colnames(base)[1]<-'PatientID'
+base <- as.data.frame(base[order(base$PatientID),])
+colnames(base)[1]<-'PatientID'
+
+#Restructure the data of drugs 
+add <- dcast(data = drugs, PatientID ~ drugs[,2], value.var = colnames(drugs)[3])
+add <- add[order(add$PatientID),]
+add <- add[,2:ncol(add)]
+colnames(add) <- paste(colnames(add), colnames(drugs)[3], sep = "_")
+base <- cbind(base,add)
+
+#Add label total drug dose and number of drugs per patient
+base$num_drugs <-rowSums(!is.na(base[,2:4]))
+base[is.na(base)] <- 0
+base$total_dose <- rowSums(base[,2:4])
+
+#dataframe with vars' patients
+base2 <- as.data.frame(num_features2[,1])
+base2 <- unique(base2)
+colnames(base2)[1]<-'PatientID'
+base2 <- as.data.frame(base2[order(base2$PatientID),])
+colnames(base2)[1]<-'PatientID'
+
+#Restructure the data of vars
+for (i in 3:ncol(num_features2)){
+  add2 <- dcast(data = num_features2, PatientID ~ num_features2[,2], 
+                value.var = colnames(num_features2)[i])
+  add2$ABPm_combined <- ifelse(is.na(add2$ABPm)==T & is.na(add2$`ABPm NI`)==F,
+                               add2$`ABPm NI`,add2$ABPm)
+  add2$ABPm <- NULL
+  add2$`ABPm NI`<- NULL
+  add2$ABPd <- NULL
+  add2$`ABPd NI`<- NULL
+  add2$ABPs <- NULL
+  add2$`ABPs NI`<- NULL
+  add2 <- add2[order(add2$PatientID),]
+  add2 <- add2[,2:ncol(add2)]
+  colnames(add2) <- paste(colnames(add2), colnames(num_features2)[i], sep = "_")
+  base2 <- cbind(base2,add2)
+}
+rm(add)
+rm(add2)
+rm(num_features2)
+pats2<-pats[!duplicated(pats$PatientID), ]
+#unify all data in "taula_res"
+taula_res<- left_join(pats2, base, by="PatientID")
+taula_res <- left_join(taula_res, base2, by="PatientID")
+
+taula_res$total_dose[is.na(taula_res$total_dose)] <- 0
+taula_res$num_drugs[is.na(taula_res$num_drugs)] <- 0
+
+taula_res$VMI[is.na(taula_res$VMI)] <- 0
+taula_res$VMI <- as.factor(as.character(taula_res$VMI))
+
+taula_res$Dobutamine_Dose[is.na(taula_res$Dobutamine_Dose)] <- 0
+taula_res$Dopamine_Dose[is.na(taula_res$Dopamine_Dose)] <- 0
+taula_res$Noradrenaline_Dose[is.na(taula_res$Noradrenaline_Dose)] <- 0
+
+rm(base)
+rm(base2)
+colnames(taula_res) <- gsub("/", "", colnames(taula_res))
+```
+
+### Add Cl, AST, ALT, alkaline phosphatase from other_vars
+
+At this point we decidied to add some vars of interest that we did not take into account during the first selection process.
+
+```{r}
+cl <- other_vars[which(other_vars$VariableID==24000644 | other_vars$VariableID==24000713), ]
+cl_median<- cl%>%
+group_by(PatientID)%>% 
+summarise(Chlorine_max=mean(MaxValue), Chlorine_min=mean(MinValue))
+
+ast <- other_vars[which(other_vars$VariableID==24000641 | other_vars$VariableID==24000710), ]
+ast_median<- ast%>%
+group_by(PatientID)%>% 
+summarise(AST_max=mean(MaxValue), AST_min=mean(MinValue))
+
+alt <- other_vars[which(other_vars$VariableID==24000707 | other_vars$VariableID==24000638), ]
+alt_median<- alt%>%
+group_by(PatientID)%>% 
+summarise(ALT_max=mean(MaxValue), ALT_min=mean(MinValue))
+
+
+phosphatase <- other_vars[which(other_vars$VariableID==24000723), ]
+phos_median<- alt%>%
+group_by(PatientID)%>% 
+summarise(alkaline_phosphatase_max=mean(MaxValue), alkaline_phosphatase_min=mean(MinValue))
+
+taula_res<-left_join(taula_res,cl_median, by='PatientID')
+taula_res<-left_join(taula_res,alt_median, by='PatientID')
+taula_res<-left_join(taula_res,ast_median, by='PatientID')
+taula_res<-left_join(taula_res,phos_median, by='PatientID')
+
+rm(cl_median, alt_median, ast_median, phos_median, phosphatase, drugs, pats, vars, other_vars, cl, ast, alt)
+```
+
+### Subset interest varaibles
+
+From the total set of vars we generate a new subset after the latest meeting. We take advantatge of an excel file which contains the final number of vars of interest. (The subset2.csv is included in the project)
+
+```{r}
+taula_res$outcome<-"NULL"
+vars_sign <- read.csv("C:/Lactate/LACTATE_PROJECT/subset2.csv",sep = ';')
+
+variables<-vars_sign[complete.cases(vars_sign$model), ]
+
+variables$X <- NULL
+
+sign <- as.vector(variables[,1])
+taula_res <- select(taula_res, sign)  
+
+taula_res<-taula_res[complete.cases(taula_res$Lactate_MaxValue), ]
+rm(sign, variables, vars_sign)
+```
+
+
+## 0.2 - Environment Setup MIMIC-III 
+
+We have MIMIC-III hosted in a local Postgres database on Windows, we built all tables and all materialized views (concepts) as well. (https://mimic.physionet.org/tutorials/install-mimic-locally-windows/).
+
+```{r, message=FALSE}
+
+# connexion:
+drv <- dbDriver("PostgreSQL")
+con <- dbConnect(drv, dbname="postgres",host="localhost",port=5432,user="postgres",password="postgres")
+
+# parametrisation of the sqldf function.
+options(sqldf.RPostgreSQL.user = "postgres"
+        , sqldf.RPostgreSQL.password = "postgres"
+        , sqldf.RPostgreSQL.dbname = "postgres"
+        , sqldf.RPostgreSQL.host = "localhost"
+        , sqldf.RPostgreSQL.port = 5432)
+
+```
+
+
+## 1.2 - Load MIMIC-III variables 
+
+Load variables from MIMIC-III database from the first 24 hours in ICU.
+
+### Load ICUintime, LOS, age and gender
+
+```{r}
+dbDisconnect(con)
+#Load icustays table
+
+query <- 'SELECT icustay_id, subject_id, hadm_id, intime FROM icustays'
+T_icustays <- sqldf(query)
+#Load DOB, DOD and Gender of patients
+query <- 'SELECT subject_id, dod_hosp FROM patients'
+ T_patients <- sqldf(query)
+ 
+ T_icustays <- left_join(T_icustays, T_patients, by="subject_id")
+ T_icustays$subject_id<-NULL
+ rm(T_patients)
+```
+
+### Load labs variables
+
+In order to take advantatge of the sql script that generates the labsfirstday values of mimic concepts we edited the script to include some vars of interest, and generated the materialized view labsfirstday_2. Users need to run it in the same way they run the regular labsfirstday during the built of the materialized concepts. (The sql script is included in the project).
+
+```{r}
+
+LacFirstDay_Q <- 'SELECT * FROM labsfirstday_2 WHERE lactate_max IS NOT NULL'
+LacFirstDay <- sqldf(LacFirstDay_Q)
+rm(LacFirstDay_Q)
+LacFirstDay$subject_id<-NULL
+LacFirstDay$hadm_id<-NULL
+``` 
+
+### Load oasis
+
+```{r}
+OASIS_Q <- 'SELECT icustay_id, oasis FROM oasis'
+OASIS <- sqldf(OASIS_Q)
+rm(OASIS_Q)
+```
+
+### Load age, gender and LOS
+
+```{r}
+Adults24hLOSmin_Q <- 'SELECT icustay_id, gender, admission_age, los_icu FROM icustay_detail'
+Adults24hLOSmin <- sqldf(Adults24hLOSmin_Q)
+rm(Adults24hLOSmin_Q)
+```
+
+### Load VMI
+
+```{r}
+#Load procedureevents_mv table
+query <- 'SELECT icustay_id, vent FROM ventfirstday'
+T_VMI <- sqldf(query)
+T_VMI$vent <- as.factor(T_VMI$vent)
+
+rm(query)
+```
+
+### Load Vassopressors (Dobutamine, Dopamine, Norepinephrine)
+
+```{r}
+#Load inputevent_mv table
+query <- 'SELECT itemid, icustay_id, amount, starttime FROM inputevents_mv WHERE itemid IN (221653,221662,221906)'
+T_vars_inputevents <- sqldf(query)
+
+rm(query)
+T_vars_inputevents <- as.data.frame(T_vars_inputevents %>% distinct(icustay_id, itemid, starttime, .keep_all = TRUE))
+
+names(T_vars_inputevents)[names(T_vars_inputevents)=="starttime"] <- "charttime"
+names(T_vars_inputevents)[names(T_vars_inputevents)=="amount"] <- "valuenum"
+#Join tables
+T_vars_times<- inner_join(T_icustays, T_vars_inputevents, by= "icustay_id")
+#time of measure first 24h
+T_vars_times$measure_time <- (ymd(T_vars_times$charttime) - ymd(T_vars_times$intime))
+T_vars_times_1stday <- T_vars_times[which(T_vars_times$measure_time<2),]
+
+rm(T_vars_times)
+#Calculate max and min
+T_vars_times_1stdayG<- T_vars_times_1stday%>%
+group_by(icustay_id, itemid)%>% 
+summarise(max=max(valuenum), min=min(valuenum), intime=mean(intime), charttime=mean(charttime))
+
+#change item_id number for name
+T_vars_times_1stdayG$itemid <- ifelse(T_vars_times_1stdayG$itemid==221653,"Dobutamine",
+                                      ifelse(T_vars_times_1stdayG$itemid==221662,"Dopamine",'Norepinephrine'))
+
+#Restructure the data
+Cohort <- as.data.frame(T_vars_times_1stdayG[,1])
+Cohort <- unique(Cohort)
+colnames(Cohort)[1]<-'icustay_id'
+Cohort <- as.data.frame(Cohort[order(Cohort$icustay_id),])
+colnames(Cohort)[1]<-'icustay_id'
+
+
+for (i in 3:4){
+add <- dcast(data = T_vars_times_1stdayG, icustay_id ~ itemid, value.var = colnames(T_vars_times_1stdayG)[i])
+add <- add[order(add$icustay_id),]
+add <- add[,2:ncol(add)]
+colnames(add) <- paste(colnames(add), colnames(T_vars_times_1stdayG)[i], sep = "_")
+ Cohort <- cbind(Cohort,add)
+}
+```
+
+### Load Admissions
+
+```{r}
+query <- 'SELECT hadm_id, admittime, admission_type FROM admissions'
+admission <- sqldf(query)
+
+admi <- left_join(T_icustays, admission, by= "hadm_id")
+library(lubridate)
+admi$days_before_icu <- (ymd(admi$intime) - ymd(admi$admittime))
+
+rm(query, admission)
+```
+
+### Join variables
+
+```{r}
+
+CohortMIMIC<-left_join(LacFirstDay, Cohort, by="icustay_id")
+CohortMIMIC<- left_join(CohortMIMIC, OASIS, by="icustay_id")
+CohortMIMIC<-left_join(CohortMIMIC, Adults24hLOSmin, by="icustay_id")
+CohortMIMIC<-left_join(CohortMIMIC, T_VMI, by="icustay_id")
+CohortMIMIC<- left_join(CohortMIMIC, admi, by="icustay_id")
+CohortMIMIC$admittime<-NULL
+CohortMIMIC$hadm_id<-NULL
+CohortMIMIC$intime<-NULL
+CohortMIMIC$admission_type <- as.factor(CohortMIMIC$admission_type)
+CohortMIMIC$gender <- as.factor(CohortMIMIC$gender)
+
+rm(LacFirstDay, OASIS, Adults24hLOSmin, T_VMI, admi, T_vars_inputevents, T_vars_times_1stday, T_vars_times_1stdayG, T_icustays, Cohort)
+
+```
+
+## 0.3 - eICU
+eICU database is also hosted in a local Postgres database on Windows. (https://eicu-crd.mit.edu/tutorials/install_eicu_locally/)
+We built all tables and all materialized views (concepts) as well.
+
+```{r, message=FALSE}
+# connexion:
+drv2 <- dbDriver("PostgreSQL")
+con2 <- dbConnect(drv, dbname="eicu",host="localhost",port=5432,user="postgres",password="postgres")
+
+# parametrisation of the sqldf function.
+options(sqldf.RPostgreSQL.user = "postgres"
+        , sqldf.RPostgreSQL.password = "postgres"
+        , sqldf.RPostgreSQL.dbname = "eicu"
+        , sqldf.RPostgreSQL.host = "localhost"
+        , sqldf.RPostgreSQL.port = 5432)
+
+```
+
+
+## 1.3 - Load eICU variables
+
+### Load lab variables
+
+In order to take advantatge of the sql script that generates the labsfirstday values of eicu concepts we edited the script to include some vars of interest, and generated the materialized view labsfirstday_modif. Users need to run it in the same way they run the regular labsfirstday during the built of the materialized concepts. (The sql script is included in the project).
+
+```{r}
+dbDisconnect(con2)
+LacFirstDay_Q <- 'SELECT * FROM eicu.labsfirstday_modif WHERE lactate_max IS NOT NULL'
+T_lact_lab <- sqldf(LacFirstDay_Q)
+rm(LacFirstDay_Q)
+T_lact_lab$uniquepid<-NULL
+T_lact_lab$patienthealthsystemstayid<-NULL
+
+T_lact_lab <- as.data.frame(T_lact_lab %>% distinct(patientunitstayid,
+                                                         .keep_all = TRUE))
+T_lact_lab$bun_min<-NULL
+```
+
+
+### Load unittype, gender, age, apache_iv, hosp_mort, icu_los_hours
+
+```{r}
+Q <- 'SELECT patientunitstayid, unittype, gender, age, hosp_mort, icu_los_hours FROM eicu.icustay_detail'
+T_icustay_eicu <- sqldf(Q)
+T_icustay_eicu$unittype <- as.factor(T_icustay_eicu$unittype)
+rm(Q)
+T_icustay_eicu <- T_icustay_eicu %>%  rename(outcome = hosp_mort)
+T_icustay_eicu$outcome<-as.factor(ifelse(T_icustay_eicu$outcome==1,'Dead','Alive'))
+T_icustay_eicu$icu_los <- T_icustay_eicu$icu_los_hours/24
+T_icustay_eicu$icu_los_hours<-NULL
+T_icustay_eicu$age <- ifelse(T_icustay_eicu$age == '> 89',91.3,T_icustay_eicu$age)
+T_icustay_eicu$age <- as.numeric(T_icustay_eicu$age)
+T_icustay_eicu$gender <- as.factor(ifelse(T_icustay_eicu$gender==1,'M','F'))
+T_icustay_eicu <- as.data.frame(T_icustay_eicu %>% distinct(patientunitstayid,
+                                                         .keep_all = TRUE))
+```
+
+### Load VMI
+
+```{r}
+Q <- 'SELECT patientunitstayid, ventStartOffset FROM eicu.respiratorycare'
+T_vent_eicu <- sqldf(Q)
+
+T_vent_eicu$vent<-T_vent_eicu$ventstartoffset/60
+## 1<- vent in the first 24h, 0<- No vent in the first 24h. 
+T_vent_eicu$vent<- ifelse(T_vent_eicu$vent>24 | T_vent_eicu$vent==0,0,1)
+T_vent_eicu$ventstartoffset<-NULL
+T_vent_eicu$vent<- as.factor(T_vent_eicu$vent)
+T_vent_eicu <- as.data.frame(T_vent_eicu %>% distinct(patientunitstayid,
+                                                         .keep_all = TRUE))
+```
+
+### Load apache IVa
+
+```{r}
+
+Q <- 'SELECT patientunitstayid, apacheScore, apacheVersion FROM eicu.apachePatientResult'
+T_apache <- sqldf(Q)
+
+T_apache <- T_apache[which(T_apache$apacheversion=='IVa'),]
+T_apache$apacheversion<-NULL
+T_apache <- as.data.frame(T_apache %>% distinct(patientunitstayid,
+                                                         .keep_all = TRUE))
+rm(Q)
+```
+
+### Load vasopressors
+
+```{r}
+
+query<- "SELECT patientunitstayid, norepinephrine, dopamine, dobutamine FROM eicu.pivoted_med WHERE chartoffset<=1440"
+T_drugs <-sqldf(query)
+
+
+T_drugs <- as.data.frame(T_drugs %>% distinct(patientunitstayid,
+                                                         .keep_all = TRUE))
+T_drugs$num_drugs<-rowSums(T_drugs[,2:4])
+
+
+```
+
+### Load days before icu
+
+```{r}
+
+query<- "SELECT patientunitstayid, hospitalAdmitOffset FROM eicu.patient WHERE hospitalAdmitOffset<=0"
+T_days_before_icu <- sqldf(query)
+
+T_days_before_icu$days_before_icu <- T_days_before_icu$hospitaladmitoffset/(60*24*-1)
+T_days_before_icu$hospitaladmitoffset<-NULL
+
+
+T_days_before_icu <- as.data.frame(T_days_before_icu %>% distinct(patientunitstayid,
+                                                         .keep_all = TRUE))
+```
+
+### Join variables
+
+```{r}
+CohorteICU <- left_join(T_lact_lab, T_icustay_eicu, by= "patientunitstayid")
+CohorteICU <- left_join(CohorteICU, T_vent_eicu, by= "patientunitstayid")
+CohorteICU <- left_join(CohorteICU, T_apache, by= "patientunitstayid")
+CohorteICU <- left_join(CohorteICU, T_drugs, by= "patientunitstayid")
+CohorteICU <- left_join(CohorteICU, T_days_before_icu, by= "patientunitstayid")
+
+
+rm(T_lact_lab, T_vent_eicu, T_apache, T_drugs, T_days_before_icu, T_icustay_eicu)
+```
+
+
+# 2 - Select patients
+
+Select patients older than 16 and with and ICU_LOS longer than 24h.
+
+## 2.1 - HJ23
+
+```{r}
+## Remove patients with less than 16 years 
+
+taula_res <- taula_res[which(taula_res$AgeAtAdm>=16),]
+taula_res <- taula_res[which(taula_res$ICU_LOS>=1),]
+```
+
+## 2.2 - MIMIC-III
+
+```{r}
+CohortMIMIC <- CohortMIMIC[which(CohortMIMIC$admission_age>=16),]
+CohortMIMIC$admission_age <- ifelse(CohortMIMIC$admission_age>200,91.3,CohortMIMIC$admission_age)
+
+CohortMIMIC <- CohortMIMIC[which(CohortMIMIC$los_icu>=1),]
+```
+
+## 2.3 - eICU
+
+```{r}
+CohorteICU <- CohorteICU[which(CohorteICU$age>=16),]
+CohorteICU <- CohorteICU[which(CohorteICU$icu_los>=1),]
+```
+
+# 3 - Create labels
+
+Create extra labels for some important variables
+
+## 3.1 - HJ23
+
+### APACHE decile and quartile label
+
+```{r, message=FALSE}
+# 2 APACHEII decile and quartile label 
+taula_res$APACHEIIdecile <- as.factor(ntile(taula_res$APACHEII, 10))
+
+taula_res$APACHEIIquartile <- as.factor(ntile(taula_res$APACHEII, 4))
+
+```
+
+### Lactate label
+
+Add 3 lactate labels for 3 different cutoff.
+lactate_label2 -  (<2=Normal;>=2=High)
+lactate_label -  (<2=Normal;>=4=High)
+lactate_label6 -  (<2=Normal;>=6=High)
+ALso add a quartile lactate label
+
+```{r, message=FALSE}
+# 3 Lactate Normal-High label
+
+taula_res$lactate_label2 <- as.factor(ifelse(taula_res$Lactate_MaxValue<2,'Normal','High'))
+
+taula_res$lactate_label <- as.factor(ifelse(taula_res$Lactate_MaxValue<2,'Normal',
+                                            ifelse(taula_res$Lactate_MaxValue>=4,'High', 'Intermediate')))
+
+taula_res$lactate_label6 <- as.factor(ifelse(taula_res$Lactate_MaxValue<2,'Normal',
+                                            ifelse(taula_res$Lactate_MaxValue>=6,'High', 'Intermediate')))
+
+taula_res$Lactate_MinValue<- NULL
+taula_res$Lactate_MedianValue<- NULL
+
+taula_res$lactate_quartile <- as.factor(ntile(taula_res$Lactate_MaxValue, 4))
+
+```
+
+### ICU-LOS quartile label
+
+1-Very short period of time, 2-Short, 3-Large, 4-Very large
+
+```{r, message=FALSE}
+# 4 ICU_LOS quartile label
+taula_res$stay <- as.factor(ntile(taula_res$ICU_LOS, 4))
+```
+
+### Outcome label
+
+Dead or alive outcome
+
+```{r, message=FALSE}
+# 5 Outcome Dead-ALive label
+taula_res$outcome <- as.factor(ifelse(taula_res$DisWardName=="EXITUS","Dead","Alive"))
+taula_res$DisWardName<-NULL
+```
+
+## 3.2 - MIMIC-III
+
+### Number o drugs and total dose
+
+Count the total amount of drugs taken per patient and the total dose. 
+
+```{r}
+CohortMIMIC$num_drugs <-rowSums(!is.na(CohortMIMIC[,23:25]))
+CohortMIMIC$Dopamine_max[is.na(CohortMIMIC$Dopamine_max)] <- 0
+CohortMIMIC$Dobutamine_max[is.na(CohortMIMIC$Dobutamine_max)] <- 0
+CohortMIMIC$Norepinephrine_max[is.na(CohortMIMIC$Norepinephrine_max)] <- 0
+```
+
+### Make oasis decile and quartile label
+
+```{r}
+CohortMIMIC$oasis_decile <- as.factor(ntile(CohortMIMIC$oasis, 10))
+CohortMIMIC$oasis_quartile <- as.factor(ntile(CohortMIMIC$oasis, 4))
+#Cohort$oasis<-NULL
+```
+
+
+###  Lactate level label
+
+Add 3 lactate labels for 3 different cutoff.
+2 -  (<2=Normal;>=2=High)
+4 -  (<2=Normal;>=4=High)
+6 -  (<2=Normal;>=6=High)
+
+```{r}
+
+CohortMIMIC$lactate_label2 <- as.factor(ifelse(CohortMIMIC$lactate_max<2,'Normal','High'))
+
+
+CohortMIMIC$lactate_label4 <- as.factor(ifelse(CohortMIMIC$lactate_max<2,'Normal',
+                               ifelse(CohortMIMIC$lactate_max>=4,'High','Intermediate')))
+
+
+CohortMIMIC$lactate_label6 <- as.factor(ifelse(CohortMIMIC$lactate_max<2,'Normal',
+                               ifelse(CohortMIMIC$lactate_max>=6,'High','Intermediate')))
+
+CohortMIMIC$lactate_quartile <- as.factor(ntile(CohortMIMIC$lactate_max, 4))
+
+```
+
+###  LOS quartile label
+
+Stay length
+
+```{r}
+CohortMIMIC$LOS_quartile <- as.factor(ntile(CohortMIMIC$los_icu, 4))
+```
+
+###  Outcome label
+ 
+If the patient has died in the hospital the outcome is Dead if not is Alive.
+```{r}
+ CohortMIMIC$outcome <- as.factor(ifelse(is.na(CohortMIMIC$dod_hosp),'Alive','Dead'))
+ CohortMIMIC$dod_hosp<-NULL
+```
+
+## 3.3 - eICU
+
+### Make oasis decile and quartile label
+
+```{r}
+CohorteICU$apacheIVa_decile <- as.factor(ntile(CohorteICU$apachescore, 10))
+CohorteICU$apacheIVa_quartile <- as.factor(ntile(CohorteICU$apachescore, 4))
+```
+
+##  Lactate level label
+
+Add 3 lactate labels for 3 different cutoff.
+2 -  (<2=Normal;>=2=High)
+4 -  (<2=Normal;>=4=High)
+6 -  (<2=Normal;>=6=High)
+
+```{r}
+
+
+CohorteICU$lactate_label2 <- as.factor(ifelse(CohorteICU$lactate_max<2,'Normal','High'))
+
+
+CohorteICU$lactate_label4 <- as.factor(ifelse(CohorteICU$lactate_max<2,'Normal',
+                               ifelse(CohorteICU$lactate_max>=4,'High','Intermediate')))
+
+
+CohorteICU$lactate_label6 <- as.factor(ifelse(CohorteICU$lactate_max<2,'Normal',
+                               ifelse(CohorteICU$lactate_max>=6,'High','Intermediate')))
+
+CohorteICU$lactate_quartile <- as.factor(ntile(CohorteICU$lactate_max, 4))
+```
+
+##  LOS quartile label
+
+Stay length
+
+```{r}
+CohorteICU$LOS_quartile <- as.factor(ntile(CohorteICU$icu_los, 4))
+```
+
+# 4 - Select only the lactate project variables
+
+## 4.1 - Cohort HJ23
+
+Select only the variables that could be related with lactate. 
+
+```{r, message=FALSE}
+
+## Cohort HJ23
+
+CohortHJ23 <- taula_res
+CohortHJ23$database <- 'HJ23'
+
+```
+
+## 4.2 - Cohort MIMIC-III
+
+```{r}
+CohortMIMIC$database <- 'MIMIC'
+
+CohortMIMIC$glucose_min<-NULL
+CohortMIMIC$Dobutamine_max<-NULL
+CohortMIMIC$Dobutamine_min<-NULL
+CohortMIMIC$Norepinephrine_max<-NULL
+CohortMIMIC$Norepinephrine_min<-NULL
+CohortMIMIC$Dopamine_max<-NULL
+CohortMIMIC$Dopamine_min<-NULL
+CohortMIMIC$admission_type<-NULL
+```
+
+## 4.3 - Cohort eICU
+
+```{r}
+
+CohorteICU$database <- 'eICU'
+CohorteICU$unittype<-NULL
+CohorteICU$norepinephrine<-NULL
+CohorteICU$dobutamine<-NULL
+CohorteICU$dopamine<-NULL
+
+```
+
+# 5 - Cohort containing HJ23, MIMIC-III and eICU databases
+
+```{r}
+
+variables <- c("PatientID", "bicarbonate_min", "bicarbonate_max", "bilirubin_max",            "creatinine_max","chlorine_min","chloride_max","glucose_max","hemoglobin_min",           "lactate_max", "platelet_min", "potassium_min","potassium_max", "sodium_min", "sodium_max",        "bun_max", "wbc_min", "wbc_max","alt_max", "ast_max","alkaline_phosphatase_max", "gender", "age", "outcome", "icu_los", "vent" , "apachescore", "num_drugs",      "days_before_icu", "apache_decile", "apache_quartile","lactate_label2","lactate_label4", "lactate_label6", "lactate_quartile", "LOS_quartile", "database")
+
+CohortMIMIC <- CohortMIMIC[,c(1:21,23:25,22,26:37)]
+CohortMIMIC <- CohortMIMIC[,c(1:23,36,24:35,37)]
+CohortMIMIC <- CohortMIMIC[,c(1:25,27,26,29,28,30:37)]
+
+names(CohortMIMIC)[1:37] <- variables
+names(CohorteICU)[1:37] <- variables
+
+CohortHJ23$PatientID <- CohortHJ23$PatientID + 1000000
+CohortMIMIC$PatientID <- CohortMIMIC$PatientID + 2000000
+CohorteICU$PatientID <- CohorteICU$PatientID + 3000000
+CohortHJ23$database <- as.factor(CohortHJ23$database)
+CohortMIMIC$database <- as.factor(CohortMIMIC$database)
+CohorteICU$database <- as.factor(CohorteICU$database)
+
+
+CohortHJ23$num_drugs <- as.factor(ifelse(CohortHJ23$num_drugs==0,'None',
+                             ifelse(CohortHJ23$num_drugs==1,'Low_Dose','High_Dose')))
+
+CohortMIMIC$num_drugs <- as.factor(ifelse(CohortMIMIC$num_drugs==0,'None',
+                             ifelse(CohortMIMIC$num_drugs==1,'Low_Dose','High_Dose')))
+
+CohorteICU$num_drugs <- as.factor(ifelse(CohorteICU$num_drugs==0,'None',
+                             ifelse(CohorteICU$num_drugs==1,'Low_Dose','High_Dose')))
+
+
+
+Cohort_all <- rbind(CohortMIMIC, CohorteICU)
+names(CohortHJ23)[1:37] <- variables
+
+Cohort_all <- rbind(Cohort_all, CohortHJ23)
+Cohort_all$gender <- as.factor(Cohort_all$gender)
+
+
+Cohort_all$apachescore<- as.numeric(Cohort_all$apachescore)
+Cohort_all$days_before_icu<- as.numeric(Cohort_all$days_before_icu)
+
+```
+
+# 6-  Tables Cohort apache quartile 4
+
+```{r}
+Cohort_50<-Cohort_all[colMeans(is.na(Cohort_all)) <= 0.5]
+#variables deleted in case that half of the patients have null information
+deleted <- Cohort_all[colMeans(is.na(Cohort_all)) > 0.5]
+
+Cohort_num<-Cohort_50[,unlist(lapply(Cohort_50, is.numeric))]
+mice_imp <- mice(Cohort_num, m=1,maxit=1, method= "cart",seed=500, remove_collinear=F)
+Cohort_mice <-mice::complete(mice_imp,1)
+
+Cohort_fact<-Cohort_50[,unlist(lapply(Cohort_50, is.factor))]
+
+Cohort_num_fact <- cbind(Cohort_mice, Cohort_fact)
+
+```
+
+## Tables
+
+```{r}
+print("included pats (older than 16, lactate available, more than 1day ICU stay)")
+nrow(Cohort_all)
+table(Cohort_all$database)
+
+# Complete cases all. Delete Nas in categorical variables
+Cohort_complete<-Cohort_num_fact[complete.cases(Cohort_num_fact), ]
+print("complete cases (no categorical vars missing (vent and gender))")
+
+nrow(Cohort_complete)
+table(Cohort_complete$database)
+#only quartile 4
+Cohort_Q4 <- Cohort_complete[which(Cohort_complete$apache_quartile==4),]
+print("q4 severity score (n_pats_included_complete)")
+nrow(Cohort_Q4)
+table(Cohort_Q4$database)
+
+# min value apache quartile 4
+print("min val severity score q4 (n_pats_included_complete)")
+Cohort_Q4_min <- Cohort_Q4[which(Cohort_Q4$database=='eICU'),]
+print("eICU")
+min(Cohort_Q4_min$apachescore)
+Cohort_Q4_min <- Cohort_Q4[which(Cohort_Q4$database=='MIMIC'),]
+print("MIMIC")
+min(Cohort_Q4_min$apachescore)
+Cohort_Q4_min <- Cohort_Q4[which(Cohort_Q4$database=='HJ23'),]
+print("HJ23")
+min(Cohort_Q4_min$apachescore)
+
+print("normal lactate <2 q4 (n_pats_included_complete) and lactate >=4 q4 (n_pats_included_complete) ")
+table(Cohort_Q4$lactate_label4)
+table(Cohort_Q4$lactate_label4, Cohort_Q4$database)
+print("lactate >=6 q4 (n_pats_included_complete) ")
+table(Cohort_Q4$lactate_label6)
+table(Cohort_Q4$lactate_label6, Cohort_Q4$database)
+
+```
+
+
+# 7 - Plots
+
+## 7.1 - All databases train and test lactate label 4
+
+```{r}
+## train test set
+Cohort_Q4_L4 <-Cohort_Q4
+Cohort_Q4_L4$lactate_max<-NULL
+Cohort_Q4_L4$apache_decile<-NULL
+Cohort_Q4_L4$apache_quartile<-NULL
+Cohort_Q4_L4$apachescore<-NULL
+#grups_quartile4$outcome<-NULL
+Cohort_Q4_L4$lactate_label2<-NULL
+Cohort_Q4_L4$lactate_label6<-NULL
+Cohort_Q4_L4$lactate_quartile<-NULL
+
+#Delete patients with intermidiate lactate level between 2 and 4
+
+Cohort_Q4_L4<- Cohort_Q4_L4[which(Cohort_Q4_L4$lactate_label4!='Intermediate'), ]
+Cohort_Q4_L4$lactate_label4<- as.factor(as.character((Cohort_Q4_L4$lactate_label4)))
+ 
+## 75% of the sample size
+set.seed(3456)
+trainIndex <- createDataPartition(Cohort_Q4_L4$lactate_label4, p = .75, 
+                                  list = FALSE, 
+                                  times = 1)
+
+Train <- Cohort_Q4_L4[ trainIndex,]
+Test  <- Cohort_Q4_L4[-trainIndex,]
+#GLM
+logit_result <- glm(lactate_label4 ~ . -outcome -icu_los -LOS_quartile -PatientID -database, data=Train ,family = 'binomial')
+
+summary(logit_result)
+prob=predict(logit_result,Train,type=c("response"))
+
+
+#ROC curve
+predictionsROCR1 = prediction(prob, Train$lactate_label4)
+ROCRPerf = performance(predictionsROCR1, "tpr", "fpr")
+plot(ROCRPerf, colorize = TRUE,text.adj=c(-0.2,1.7))
+
+
+auc1 = as.numeric(performance(predictionsROCR1,"auc")@y.values)
+#Area under the curve
+auc1
+
+##
+
+pred <- predict(logit_result, Test,type=c("response"))
+
+
+#ROC curve
+require(ROCR)
+predictionsROCR2 = prediction(pred, Test$lactate_label4)
+ROCRPerf2 = performance(predictionsROCR2, "tpr", "fpr")
+plot(ROCRPerf2, colorize = TRUE,text.adj=c(-0.2,1.7))
+
+auc2 = as.numeric(performance(predictionsROCR2,"auc")@y.values)
+#Area under the curve
+auc2
+```
+
+
+## 7.2 - All databases train and test lactate label 6
+
+```{r}
+## train test set
+Cohort_Q4_L6 <-Cohort_Q4
+Cohort_Q4_L6$lactate_max<-NULL
+Cohort_Q4_L6$apache_decile<-NULL
+Cohort_Q4_L6$apache_quartile<-NULL
+Cohort_Q4_L6$apachescore<-NULL
+#grups_quartile4$outcome<-NULL
+Cohort_Q4_L6$lactate_label2<-NULL
+Cohort_Q4_L6$lactate_label4<-NULL
+Cohort_Q4_L6$lactate_quartile<-NULL
+
+#Delete patients with intermidiate lactate level between 2 and 4
+
+Cohort_Q4_L6<- Cohort_Q4_L6[which(Cohort_Q4_L6$lactate_label6!='Intermediate'), ]
+Cohort_Q4_L6$lactate_label6<- as.factor(as.character((Cohort_Q4_L6$lactate_label6)))
+ 
+## 75% of the sample size
+
+library(caret)
+set.seed(3456)
+trainIndex <- createDataPartition(Cohort_Q4_L6$lactate_label6, p = .75, 
+                                  list = FALSE, 
+                                  times = 1)
+
+Train <- Cohort_Q4_L6[ trainIndex,]
+Test  <- Cohort_Q4_L6[-trainIndex,]
+#GLM
+logit_result <- glm(lactate_label6 ~ . -outcome -icu_los -LOS_quartile -PatientID -database, data=Train ,family = 'binomial')
+
+summary(logit_result)
+prob=predict(logit_result,Train,type=c("response"))
+
+
+#ROC curve
+require(ROCR)
+predictionsROCR1 = prediction(prob, Train$lactate_label6)
+ROCRPerf = performance(predictionsROCR1, "tpr", "fpr")
+plot(ROCRPerf, colorize = TRUE,text.adj=c(-0.2,1.7))
+
+
+auc1 = as.numeric(performance(predictionsROCR1,"auc")@y.values)
+#Area under the curve
+auc1
+
+##
+
+pred <- predict(logit_result, Test,type=c("response"))
+
+
+#ROC curve
+require(ROCR)
+predictionsROCR2 = prediction(pred, Test$lactate_label6)
+ROCRPerf2 = performance(predictionsROCR2, "tpr", "fpr")
+plot(ROCRPerf2, colorize = TRUE,text.adj=c(-0.2,1.7))
+
+auc2 = as.numeric(performance(predictionsROCR2,"auc")@y.values)
+#Area under the curve
+auc2
+```
+
+
+## 7.3 - Train HJ23 and test eiCU+MIMI-III lactate label 4
+
+```{r}
+## train test set
+
+Train <- Cohort_Q4_L4[which(Cohort_Q4_L4$database=='HJ23'), ]
+Test  <- Cohort_Q4_L4[which(Cohort_Q4_L4$database=='MIMIC' | Cohort_Q4_L4$database=='eICU'),]
+
+Train$database<-NULL
+Test$database<-NULL
+#GLM
+logit_result <- glm(lactate_label4 ~ . -outcome -icu_los -LOS_quartile -PatientID , data=Train, family = 'binomial')
+
+summary(logit_result)
+
+##Train
+prob=predict(logit_result,Train,type=c("response"))
+
+#ROC curve
+require(ROCR)
+predictionsROCR1 = prediction(prob, Train$lactate_label4)
+ROCRPerf = performance(predictionsROCR1, "tpr", "fpr")
+plot(ROCRPerf, colorize = TRUE,text.adj=c(-0.2,1.7))
+
+
+auc1 = as.numeric(performance(predictionsROCR1,"auc")@y.values)
+#Area under the curve
+auc1
+
+##Test
+
+pred <- predict(logit_result, Test,type=c("response"))
+
+
+#ROC curve
+require(ROCR)
+predictionsROCR2 = prediction(pred, Test$lactate_label4)
+ROCRPerf2 = performance(predictionsROCR2, "tpr", "fpr")
+plot(ROCRPerf2, colorize = TRUE,text.adj=c(-0.2,1.7))
+
+auc2 = as.numeric(performance(predictionsROCR2,"auc")@y.values)
+#Area under the curve
+auc2
+```
+
+
+## 7.4 - Train MIMIC and test eiCU+HJ23 lactate label 4
+```{r}
+## train test set
+
+Train <- Cohort_Q4_L4[which(Cohort_Q4_L4$database=='MIMIC'), ]
+Test  <- Cohort_Q4_L4[which(Cohort_Q4_L4$database=='HJ23' | Cohort_Q4_L4$database=='eICU'),]
+
+Train$database<-NULL
+Test$database<-NULL
+#GLM
+logit_result <- glm(lactate_label4 ~ . -outcome -icu_los -LOS_quartile -PatientID , data=Train ,family = 'binomial')
+
+summary(logit_result)
+
+##Train
+prob=predict(logit_result,Train,type=c("response"))
+
+#ROC curve
+require(ROCR)
+predictionsROCR1 = prediction(prob, Train$lactate_label4)
+ROCRPerf = performance(predictionsROCR1, "tpr", "fpr")
+plot(ROCRPerf, colorize = TRUE,text.adj=c(-0.2,1.7))
+
+
+auc1 = as.numeric(performance(predictionsROCR1,"auc")@y.values)
+#Area under the curve
+auc1
+
+##Test
+
+pred <- predict(logit_result, Test,type=c("response"))
+
+
+#ROC curve
+require(ROCR)
+predictionsROCR2 = prediction(pred, Test$lactate_label4)
+ROCRPerf2 = performance(predictionsROCR2, "tpr", "fpr")
+plot(ROCRPerf2, colorize = TRUE,text.adj=c(-0.2,1.7))
+
+auc2 = as.numeric(performance(predictionsROCR2,"auc")@y.values)
+#Area under the curve
+auc2
+```
+
+
+## 7.5 - Train eICU and test MIMIC+HJ23 lactate label 4
+```{r}
+## train test set
+
+Train <- Cohort_Q4_L4[which(Cohort_Q4_L4$database=='eICU'), ]
+Test  <- Cohort_Q4_L4[which(Cohort_Q4_L4$database=='HJ23' | Cohort_Q4_L4$database=='MIMIC'),]
+
+Train$database<-NULL
+Test$database<-NULL
+#GLM
+logit_result <- glm(lactate_label4 ~ . -outcome -icu_los -LOS_quartile -PatientID , data=Train ,family = 'binomial')
+
+summary(logit_result)
+
+##Train
+prob=predict(logit_result,Train,type=c("response"))
+
+#ROC curve
+require(ROCR)
+predictionsROCR1 = prediction(prob, Train$lactate_label4)
+ROCRPerf = performance(predictionsROCR1, "tpr", "fpr")
+plot(ROCRPerf, colorize = TRUE,text.adj=c(-0.2,1.7))
+
+
+auc1 = as.numeric(performance(predictionsROCR1,"auc")@y.values)
+#Area under the curve
+auc1
+
+##Test
+
+pred <- predict(logit_result, Test,type=c("response"))
+
+
+#ROC curve
+require(ROCR)
+predictionsROCR2 = prediction(pred, Test$lactate_label4)
+ROCRPerf2 = performance(predictionsROCR2, "tpr", "fpr")
+plot(ROCRPerf2, colorize = TRUE,text.adj=c(-0.2,1.7))
+
+auc2 = as.numeric(performance(predictionsROCR2,"auc")@y.values)
+#Area under the curve
+auc2
+```
+
+
+## 7.6 - Train HJ23 and test eiCU+MIMIC lactate label 6
+```{r}
+## train test set
+
+Train <- Cohort_Q4_L6[which(Cohort_Q4_L6$database=='HJ23'), ]
+Test  <- Cohort_Q4_L6[which(Cohort_Q4_L6$database=='MIMIC' | Cohort_Q4_L6$database=='eICU'),]
+
+Train$database<-NULL
+Test$database<-NULL
+#GLM
+logit_result <- glm(lactate_label6 ~ . -outcome -icu_los -LOS_quartile -PatientID , data=Train ,family = 'binomial')
+
+summary(logit_result)
+
+##Train
+prob=predict(logit_result,Train,type=c("response"))
+
+#ROC curve
+require(ROCR)
+predictionsROCR1 = prediction(prob, Train$lactate_label6)
+ROCRPerf = performance(predictionsROCR1, "tpr", "fpr")
+plot(ROCRPerf, colorize = TRUE,text.adj=c(-0.2,1.7))
+
+
+auc1 = as.numeric(performance(predictionsROCR1,"auc")@y.values)
+#Area under the curve
+auc1
+
+##Test
+
+pred <- predict(logit_result, Test,type=c("response"))
+
+
+#ROC curve
+require(ROCR)
+predictionsROCR2 = prediction(pred, Test$lactate_label6)
+ROCRPerf2 = performance(predictionsROCR2, "tpr", "fpr")
+plot(ROCRPerf2, colorize = TRUE,text.adj=c(-0.2,1.7))
+
+auc2 = as.numeric(performance(predictionsROCR2,"auc")@y.values)
+#Area under the curve
+auc2
+```
+
+
+## 7.7 - Train MIMIC3 and test eiCU+HJ23 lactate label 6
+```{r}
+## train test set
+
+Train <- Cohort_Q4_L6[which(Cohort_Q4_L6$database=='MIMIC'), ]
+Test  <- Cohort_Q4_L6[which(Cohort_Q4_L6$database=='HJ23' | Cohort_Q4_L6$database=='eICU'),]
+
+Train$database<-NULL
+Test$database<-NULL
+#GLM
+logit_result <- glm(lactate_label6 ~ . -outcome -icu_los -LOS_quartile -PatientID , data=Train ,family = 'binomial')
+
+summary(logit_result)
+
+##Train
+prob=predict(logit_result,Train,type=c("response"))
+
+#ROC curve
+require(ROCR)
+predictionsROCR1 = prediction(prob, Train$lactate_label6)
+ROCRPerf = performance(predictionsROCR1, "tpr", "fpr")
+plot(ROCRPerf, colorize = TRUE,text.adj=c(-0.2,1.7))
+
+
+auc1 = as.numeric(performance(predictionsROCR1,"auc")@y.values)
+#Area under the curve
+auc1
+
+##Test
+
+pred <- predict(logit_result, Test,type=c("response"))
+
+
+#ROC curve
+require(ROCR)
+predictionsROCR2 = prediction(pred, Test$lactate_label6)
+ROCRPerf2 = performance(predictionsROCR2, "tpr", "fpr")
+plot(ROCRPerf2, colorize = TRUE,text.adj=c(-0.2,1.7))
+
+auc2 = as.numeric(performance(predictionsROCR2,"auc")@y.values)
+#Area under the curve
+auc2
+```
+
+
+## 7.7 - Train eICU and test HJ23+MIMIC lactate label 6
+```{r}
+## train test set
+
+Train <- Cohort_Q4_L6[which(Cohort_Q4_L6$database=='eICU'), ]
+Test  <- Cohort_Q4_L6[which(Cohort_Q4_L6$database=='HJ23' | Cohort_Q4_L6$database=='eICU'),]
+
+Train$database<-NULL
+Test$database<-NULL
+#GLM
+logit_result <- glm(lactate_label6 ~ . -outcome -icu_los -LOS_quartile -PatientID , data=Train ,family = 'binomial')
+
+summary(logit_result)
+
+##Train
+prob=predict(logit_result,Train,type=c("response"))
+
+#ROC curve
+require(ROCR)
+predictionsROCR1 = prediction(prob, Train$lactate_label6)
+ROCRPerf = performance(predictionsROCR1, "tpr", "fpr")
+plot(ROCRPerf, colorize = TRUE,text.adj=c(-0.2,1.7))
+
+
+auc1 = as.numeric(performance(predictionsROCR1,"auc")@y.values)
+#Area under the curve
+auc1
+
+##Test
+
+pred <- predict(logit_result, Test,type=c("response"))
+
+
+#ROC curve
+require(ROCR)
+predictionsROCR2 = prediction(pred, Test$lactate_label6)
+ROCRPerf2 = performance(predictionsROCR2, "tpr", "fpr")
+plot(ROCRPerf2, colorize = TRUE,text.adj=c(-0.2,1.7))
+
+auc2 = as.numeric(performance(predictionsROCR2,"auc")@y.values)
+#Area under the curve
+auc2
+```
+
+## Descriptive Table
+```{r}
+summary(Cohort_all)
+
+
+```
+
+#Disconnect
+```{r}
+dbDisconnect(con)
+dbDisconnect(con2)
+```
+
+
+
